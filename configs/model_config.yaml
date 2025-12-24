@@ -1,0 +1,27 @@
+# 数据配置
+data:
+  raw_data_path: "data/raw/qwen_corpus.txt"  # 原始语料路径
+  max_seq_len: 128                           # 最大序列长度
+  tokenizer_save_path: "outputs/tokenizer/qwen_micro_tokenizer.json"  # 分词器保存路径
+  vocab_size: 1000                           # 分词器词汇表大小
+
+# 模型配置
+model:
+  dim: 128                                   # 模型核心维度
+  num_heads: 4                               # 注意力头数
+  num_layers: 2                              # Decoder Block数量
+  hidden_dim: 256                            # Swiglu隐藏层维度
+  max_seq_len: 128                           # 模型最大序列长度
+  model_save_path: "outputs/model/qwen_micro_model.pth"  # 模型保存路径
+
+# 训练配置
+train:
+  epochs: 200                                # 训练轮数
+  lr: 0.001                                  # 学习率
+  weight_decay: 0.01                         # 权重衰减（AdamW）
+  grad_clip_norm: 1.0                        # 梯度裁剪阈值
+  device: "auto"                             # 设备（auto/cuda/cpu）
+
+# 推理配置
+generate:
+  max_new_tokens: 32                         # 生成的最大新token数
