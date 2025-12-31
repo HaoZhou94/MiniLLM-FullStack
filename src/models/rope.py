@@ -35,5 +35,38 @@ class DynamicRoPE(nn.Module):
         x_rot = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
         return x_rot
 
+def apply_rope(q,k,seq_len):
+    """
+    对Q/K向量应用RoPE
+    :param q: Q向量，形状为(batch_size, num_heads, seq_len, head_dim)
+    :param k: K向量，形状为(batch_size, num_heads, seq_len, head_dim)
+    :param seq_len: 序列长度
+    :return: 旋转后的Q/K向量
+    """
+    batch_size, num_heads, _, head_dim = q.shape
+    assert head_dim % 2 == 0, "head_dim必须是偶数"
 
-    
+    # 步骤1: 计算角度系数a_k
+    k_indices = torch.arange(0, head_dim, 2, dtype=q.device)
+    alpha = 10000.0 ** (-2 * k_indices / head_dim)  # [head_dim/2]
+    m = torch.arange(seq_len, device=q.device)[:, None]  # [seq_len, 1]
+
+    # m 扩展为 [3,2]（列扩展）
+    # m_expanded = [[0, 0],
+    #               [1, 1],
+    #               [2, 2]]
+    #
+    # # alpha 扩展为 [3,2]（行扩展）
+    # alpha_expanded = [[1.0, 0.0001],
+    #                   [1.0, 0.0001],
+    #                   [1.0, 0.0001]]
+
+    # theta = m_expanded * alpha_expanded
+        # =   [[0×1.0, 0×0.0001],
+        #     [1×1.0, 1×0.0001],
+        #     [2×1.0, 2×0.0001]]
+        # =   [[0.0, 0.0],
+        #     [1.0, 0.0001],
+        #     [2.0, 0.0002]]
+    theta = m * alpha  # [seq_len, head_dim/2]
+
