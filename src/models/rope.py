@@ -16,6 +16,15 @@ sys.path.append(project_root)
 
 from src.utils.logger import logger
 
+# 1. 强制固定所有随机种子（绝对可复现）
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"  # 自动选择设备
 
 
@@ -140,8 +149,12 @@ class DynamicRoPE(nn.Module):
         # 计算位置-二维对的旋转角度（外积等价于广播乘法）
         pos_theta = torch.outer(pos.float(), self.theta).to(x.device)
         # 扩展sin/cos到与x最后一维同维度（每个二维对的sin/cos重复2次）
-        sin = torch.sin(pos_theta)  # [5,4]（无需重复）
-        cos = torch.cos(pos_theta)  # [5,4]（无需重复）
+        # sin = torch.sin(pos_theta)  # [5,4]（无需重复）
+        # cos = torch.cos(pos_theta)  # [5,4]（无需重复）
+
+        cos = torch.cos(pos_theta).unsqueeze(0).unsqueeze(0)  # [1,1,5,4]
+        sin = torch.sin(pos_theta).unsqueeze(0).unsqueeze(0)  # [1,1,5,4]
+
         # 旋转计算
         x1 = x[..., ::2]  # 偶数位 #[batch, seq_len, 总维度/2]
         x2 = x[..., 1::2] # 奇数位
@@ -167,9 +180,11 @@ class DynamicRoPE(nn.Module):
         cos 中维度为 1 的位置（batch/num_heads 维度）会被逻辑扩展为 2 和 8；
         扩展后 cos 的形状与 x1 完全一致，因此可以逐元素相乘（每个位置的元素一一对应）。
         简单说：广播让 “形状看似不同” 的两个张量，变成了 “运算时形状完全相同” 的张量，这是 PyTorch 实现向量化运算的核心技巧。
-                
         """
-        x_rot = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+        x1_rot = x1 * cos - x2 * sin
+        x2_rot = x1 * sin + x2 * cos
+        # x_rot = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+        x_rot = torch.stack([x1_rot, x2_rot], dim=-1).flatten(-2)
         return x_rot
 
 
@@ -194,20 +209,119 @@ if __name__ == "__main__":
     pos = torch.arange(SEQ_LEN, device=DEVICE)  # 形状 [SEQ_LEN] = [5]
     logger.info(f"位置索引pos形状：{pos.shape}，值：{pos.tolist()}")
 
-    # 构造测试Q向量（格式1：[batch_size, seq_len, dim]，Transformer标准输入）
-    # x = torch.randn(BATCH_SIZE, SEQ_LEN, DIM, device=DEVICE)  # 形状 [2,5,64]
-    x = torch.randn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, rope.head_dim, device=DEVICE)  # [2,8,5,8]
+    # 2. 关键：构造确定性Q/K（全1向量，无随机噪声）
+    # 形状：[batch, num_heads, seq_len, head_dim] = [2,8,5,8]
+    q = torch.randn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, rope.head_dim, device=DEVICE)
+    k = torch.randn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, rope.head_dim, device=DEVICE)
 
-    logger.info(f"原始Q向量形状：{x.shape}")
+    # ===================== 步骤2：构造测试输入（修正核心问题） =====================
+    # 2.1 构造完整的位置序列（正确的pos参数）
+    pos = torch.arange(SEQ_LEN, device=DEVICE)  # [0,1,2,3,4]（形状[5]）
+    logger.info(f"位置索引pos形状：{pos.shape}，值：{pos.tolist()}")
 
-    # ===================== 步骤3：调用forward执行RoPE =====================
-    x_rot = rope(x, pos)
-    # 验证输出维度与输入一致
-    assert x_rot.shape == x.shape, "RoPE输出维度与输入不一致！"
-    logger.info(f"✅ RoPE执行成功，旋转后Q向量形状：{x_rot.shape}")
+    # # 2.2 构造确定性Q/K（全1向量，消除随机噪声）
+    # q = torch.ones(BATCH_SIZE, NUM_HEADS, SEQ_LEN, rope.head_dim, device=DEVICE)
+    # k = torch.ones(BATCH_SIZE, NUM_HEADS, SEQ_LEN, rope.head_dim, device=DEVICE)
+    #
+    # # ===================== 步骤3：正确应用RoPE（一次性旋转整个序列） =====================
+    # q_rot = rope(q, pos)  # 对整个Q序列旋转（pos是完整序列）
+    # k_rot = rope(k, pos)  # 对整个K序列旋转（pos是完整序列）
+    # assert q_rot.shape == q.shape, "RoPE输出维度与输入不一致！"
+    # logger.info(f"✅ RoPE执行成功，旋转后Q/K形状：{q_rot.shape}")
+    #
+    # # ===================== 步骤4：验证RoPE核心特性（修正所有错误） =====================
+    # logger.info("\n===== 验证RoPE核心特性：相对位置相同，点积相等 =====")
+    # # 取单个头的Q/K（batch=0, head=0）
+    # q_rot_single = q_rot[0, 0]  # [5,8]（5个位置，每个位置8维）
+    # k_rot_single = k_rot[0, 0]  # [5,8]
+    #
+    # # 验证1：Δ=1 → Q0·K1 和 Q2·K3 严格相等
+    # dot_q0k1 = (q_rot_single[0] * k_rot_single[1]).sum().item()
+    # dot_q2k3 = (q_rot_single[2] * k_rot_single[3]).sum().item()
+    #
+    # # 验证2：Δ=2 → Q0·K2 和 Q1·K3 严格相等
+    # dot_q0k2 = (q_rot_single[0] * k_rot_single[2]).sum().item()
+    # dot_q1k3 = (q_rot_single[1] * k_rot_single[3]).sum().item()
+    #
+    #
+    #
+    #
+    # # 输出结果
+    # print("===== 无随机噪声：RoPE严格相等验证 =====")
+    # print(f"Δ=1 - Q0·K1 = {dot_q0k1:.9f}, Q2·K3 = {dot_q2k3:.9f}")
+    # print(f"Δ=1 差值 = {abs(dot_q0k1 - dot_q2k3):.9f} → 严格相等")
+    # print(f"\nΔ=2 - Q0·K2 = {dot_q0k2:.9f}, Q1·K3 = {dot_q1k3:.9f}")
+    # print(f"Δ=2 差值 = {abs(dot_q0k2 - dot_q1k3):.9f} → 严格相等")
 
-    # ===================== 步骤4：验证RoPE核心特性（相对位置点积相等） =====================
-    logger.info("\n===== 验证RoPE核心特性：相对位置相同，点积相等 =====")
-    # 取第一个样本的Q向量（简化验证）
-    x_rot_sample0 = x_rot[0]  # 形状 [SEQ_LEN, DIM] = [5,64]
+    # 2.2 全1 Q/K（消除随机噪声，验证严格相等）
+    q = torch.ones(BATCH_SIZE, NUM_HEADS, SEQ_LEN, rope.head_dim, device=DEVICE)
+    k = torch.ones(BATCH_SIZE, NUM_HEADS, SEQ_LEN, rope.head_dim, device=DEVICE)
 
+    # ===================== 步骤3：应用RoPE =====================
+    q_rot = rope(q, pos)
+    k_rot = rope(k, pos)
+    assert q_rot.shape == q.shape, "RoPE输出维度错误"
+    logger.info(f"✅ RoPE执行成功，旋转后Q/K形状：{q_rot.shape}")
+
+    # ===================== 步骤4：全面验证不同相对位置 =====================
+    # 取单个头（batch=0, head=0），聚焦核心规律
+    q_single = q_rot[0, 0]  # [5,8]：5个位置，每个位置8维
+    k_single = k_rot[0, 0]  # [5,8]
+
+    # 定义验证用的「相对位置-位置对」映射（覆盖所有可能的Δ）
+    verify_pairs = {
+        "Δ=1（相邻位置）": [
+            (0, 1),  # Q0·K1
+            (1, 2),  # Q1·K2
+            (2, 3),  # Q2·K3
+            (3, 4)  # Q3·K4
+        ],
+        "Δ=2（隔1个位置）": [
+            (0, 2),  # Q0·K2
+            (1, 3),  # Q1·K3
+            (2, 4)  # Q2·K4
+        ],
+        "Δ=3（隔2个位置）": [
+            (0, 3),  # Q0·K3
+            (1, 4)  # Q1·K4
+        ],
+        "Δ=4（隔3个位置）": [
+            (0, 4)  # Q0·K4
+        ]
+    }
+
+    # 计算所有位置对的点积，并分析规律
+    results = {}
+    for delta_desc, pairs in verify_pairs.items():
+        dot_values = []
+        for q_idx, k_idx in pairs:
+            dot = (q_single[q_idx] * k_single[k_idx]).sum().item()
+            dot_values.append(round(dot, 9))  # 保留9位小数，看严格相等
+        results[delta_desc] = dot_values
+
+    # ===================== 步骤5：输出验证结果 =====================
+    print("\n" + "=" * 60)
+    print("📊 不同相对位置的Q-K点积验证结果（全1向量，无随机噪声）")
+    print("=" * 60)
+    for delta_desc, dot_values in results.items():
+        print(f"\n{delta_desc}：")
+        print(f"  点积值列表：{dot_values}")
+        if len(dot_values) >= 2:
+            # 计算相同Δ的最大差值（验证严格相等）
+            max_diff = max(dot_values) - min(dot_values)
+            print(f"  相同Δ的最大差值：{max_diff:.9f} → {'严格相等' if max_diff < 1e-6 else '近似相等'}")
+        else:
+            print(f"  唯一值：无差值（基准参考）")
+
+    # 额外验证：不同Δ的点积差异（证明RoPE能区分不同位置）
+    print("\n" + "-" * 60)
+    print("🔍 不同Δ的点积基准值对比（证明位置区分能力）")
+    print("-" * 60)
+    delta_baseline = {
+        "Δ=1 基准": results["Δ=1（相邻位置）"][0],
+        "Δ=2 基准": results["Δ=2（隔1个位置）"][0],
+        "Δ=3 基准": results["Δ=3（隔2个位置）"][0],
+        "Δ=4 基准": results["Δ=4（隔3个位置）"][0]
+    }
+    for delta, val in delta_baseline.items():
+        print(f"{delta}：{val:.9f}")
