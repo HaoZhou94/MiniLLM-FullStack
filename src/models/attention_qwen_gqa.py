@@ -67,22 +67,51 @@ class QwenGQA(nn.Module):
         device = x.device
 
         # === 1. Q/K/V投影 ===
-
-
-
-
-
+        q = self.q_proj(x).reshape(batch_size, seq_len, self.num_query_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
 
         # === 2. 应用RoPE ===
+        positions = torch.arange(seq_len, device=device)
+        q = self.rope(q, positions)
+        k = self.rope(k, positions)
 
+        if use_cache:
+            # === 3. KV缓存增量更新 ===
+            cache_pos = self.cache_position.item()
+            self.kv_cache_k[:batch_size, :, cache_pos:cache_pos+seq_len, :] = k
+            self.kv_cache_v[:batch_size, :, cache_pos:cache_pos+seq_len, :] = v
+            """
+            关键：只往“当前页码到当前页码+新token数”的位置填值
+            你的例子：
+            - cache_pos=0，seq_len=1 → 填0:1的位置（第0页）
+            - k的形状是[1,2,1,16]（新token的K）
+            - 赋值后：kv_cache_k[1,2,0:1,16] = 新K（第0页不再是0，其他页还是0）
+            比喻：把新token的K/V写在笔记本第0页，其他页仍空白
+            """
 
+            # 3. 推理时使用完整缓存的KV（历史+新）
+            k = self.kv_cache_k[:batch_size, :, :cache_pos+seq_len, :]
+            v = self.kv_cache_v[:batch_size, :, :cache_pos+seq_len, :]
+            """
+            关键：读取“从开头到当前页码+新token数”的所有KV（历史+新）
+            你的例子：
+            - cache_pos+seq_len=1 → 读:1的位置（第0页）
+            - k的形状变成[1,2,1,16]（缓存里的新K）
+            比喻：翻笔记本，从第一页读到刚写完的第0页，拿到所有已写的内容
+            """
+            # 4. 更新缓存位置（页码往后翻）
 
+            self.cache_position += seq_len
 
-
-        # === 3. KV缓存增量更新 ===
-
-
+            # 5. 重新计算有效序列长度（缓存里已存的token数）
+            kv_seq_len = cache_pos + seq_len  # 0+1=1 → 有效长度1
+            """
+            作用：告诉注意力计算，现在要用到的KV总长度是1（仅新token）
+            """
+        else:
+            kv_seq_len = seq_len  # 不用缓存时，有效长度就是当前输入的长度
 
 
         # ===== 4. GQA核心：KV按组扩展（Qwen官方分组逻辑）=====
