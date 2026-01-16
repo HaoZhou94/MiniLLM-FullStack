@@ -73,7 +73,6 @@ class MaskedMultiHeadAttention(nn.Module):
         # 3. 计算注意力机制分数: Q @ K^T / sqrt(head_dim)
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-
         # 4. 应用未来掩码
         mask = self._create_mask(seq_len)
         attn_scores = attn_scores.masked_fill(mask, -1e9)
@@ -85,12 +84,9 @@ class MaskedMultiHeadAttention(nn.Module):
         # 6. 拼接多头并投影
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, dim)
         out = self.out_proj(attn_output)
-
         return out
 
 if __name__ == "__main__":
-
-
     # 初始化注意力层（适配Qwen-Micro）
     attn = MaskedMultiHeadAttention(dim=64,num_heads=2)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
