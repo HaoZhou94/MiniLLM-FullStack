@@ -7,7 +7,7 @@ import math
 from jinja2.compiler import F
 
 current_path = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_path, "../../"))
+project_root = os.path.abspath(os.path.join(current_path, "../"))
 sys.path.append(project_root)
 
 from src.models.rope import DynamicRoPE
