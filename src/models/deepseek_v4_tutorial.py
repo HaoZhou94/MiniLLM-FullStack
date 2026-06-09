@@ -297,24 +297,47 @@ class LightningIndexer(nn.Module):
             topk_indices:  [B, nh, Tq, top_k_index] — 压缩 entry 的索引
             topk_scores:   [B, nh, Tq, top_k_index] — 对应的索引得分（用于后续权重调整）
         """
+        # B, nh, Tq, _ = q.shape
+        # Tck = k_compressed.shape[2]
+        #
+        # # Step 1: 投影到低维索引空间
+        # q_index = self.q_index_proj(q)  # [B, nh, Tq, index_dim]
+        # k_index = self.k_index_proj(k_compressed)  # [B, nh, Tck, index_dim]
+        #
+        # # Step 2: 计算轻量级相关性得分
+        # # [B, nh, Tq, index_dim] @ [B, nh, index_dim, Tck] → [B, nh, Tq, Tck]
+        # index_scores = torch.matmul(q_index, k_index.transpose(-1, -2))
+        #
+        # import pdb;pdb.set_trace()
+        # index_scores = index_scores * self.scale
+        #
+        # # Step 3: top-k 选择
+        # # 取 top_k_index 个最相关的 entry
+        # actual_k = min(self.top_k_index, Tck)
+        # topk_scores, topk_indices = torch.topk(index_scores, actual_k, dim=-1)
+        #
+        # return topk_indices, topk_scores
+
         B, nh, Tq, _ = q.shape
         Tck = k_compressed.shape[2]
 
-        # Step 1: 投影到低维索引空间
-        q_index = self.q_index_proj(q)  # [B, nh, Tq, index_dim]
-        k_index = self.k_index_proj(k_compressed)  # [B, nh, Tck, index_dim]
+        # # Step 1: 投影到低维索引空间
+        q_index = self.q_index_proj(q)     #[B, nh, Tq, index_dim]
+        k_index = self.k_index_proj(k_compressed)   #[B, nh, Tck, index_dim]
 
-        # Step 2: 计算轻量级相关性得分
-        # [B, nh, Tq, index_dim] @ [B, nh, index_dim, Tck] → [B, nh, Tq, Tck]
+        # # Step 2: 计算轻量级相关性得分
+        # # [B, nh, Tq, index_dim] @ [B, nh, index_dim, Tck] -> [B, nh, Tq, Tck]
         index_scores = torch.matmul(q_index, k_index.transpose(-1, -2))
         index_scores = index_scores * self.scale
 
-        # Step 3: top-k 选择
-        # 取 top_k_index 个最相关的 entry
-        actual_k = min(self.top_k_index, Tck)
+        # # Step 3: top-k 选择
+        # # 取 top_k_index 个最相关的 entry
+        actual_k = min(Tck, self.top_k_index)
         topk_scores, topk_indices = torch.topk(index_scores, actual_k, dim=-1)
 
+        # import pdb; pdb.set_trace()
         return topk_indices, topk_scores
+
 
 
 # ── 测试 ──────────────────────────────────────────────────────────────────────
@@ -393,23 +416,32 @@ class CompressedSparseAttention(nn.Module):
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
         # ── Q/K/V 投影 ──────────────────────────────────────────────────
+        # self.q_proj = nn.Linear(d_model, d_model, bias=bias)
+        # self.k_proj = nn.Linear(d_model, d_model, bias=bias)
+        # self.v_proj = nn.Linear(d_model, d_model, bias=bias)
+        # self.o_proj = nn.Linear(d_model, d_model, bias=bias)
+
         self.q_proj = nn.Linear(d_model, d_model, bias=bias)
         self.k_proj = nn.Linear(d_model, d_model, bias=bias)
         self.v_proj = nn.Linear(d_model, d_model, bias=bias)
         self.o_proj = nn.Linear(d_model, d_model, bias=bias)
 
+
         # ── KV 压缩器 ────────────────────────────────────────────────────
-        self.kv_compressor = KVCompressor(
-            self.head_dim, block_size=compression_block, mode="learned"
-        )
+        # self.kv_compressor = KVCompressor(
+        #     self.head_dim, block_size=compression_block, mode="learned"
+        # )
+        self.kv_compressor = KVCompressor(self.head_dim, block_size=self.compression_block, mode="learned")
 
         # ── Lightning Indexer ─────────────────────────────────────────────
-        self.indexer = LightningIndexer(
-            head_dim=self.head_dim,
-            index_dim=index_dim,
-            top_k_index=top_k_index,
-        )
+        # self.indexer = LightningIndexer(
+        #     head_dim=self.head_dim,
+        #     index_dim=index_dim,
+        #     top_k_index=top_k_index,
+        # )
+        self.indexer = LightningIndexer(head_dim = self.head_dim, index_dim = index_dim, top_k_index = top_k_index)
 
+        # self.dropout = nn.Dropout(dropout)
         self.dropout = nn.Dropout(dropout)
 
     def _split_heads(self, x: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -431,34 +463,48 @@ class CompressedSparseAttention(nn.Module):
 
         # ── Step 1: Q/K/V 投影 ─────────────────────────────────────────
         q = self._split_heads(self.q_proj(hidden_states), B)     # [B, nh, T, hd]
-        k = self._split_heads(self.k_proj(hidden_states), B)     # [B, nh, T, hd]
-        v = self._split_heads(self.v_proj(hidden_states), B)     # [B, nh, T, hd]
+        k = self._split_heads(self.k_proj(hidden_states), B)
+        v = self._split_heads(self.v_proj(hidden_states), B)
 
-        # ── Step 2: KV 压缩 ────────────────────────────────────────────
-        # Compression ratio: T → T/m
-        k_compressed, v_compressed = self.kv_compressor(k, v)
-        # [B, nh, T_c, hd], T_c = T // m
+
+        # # ── Step 2: KV 压缩 ────────────────────────────────────────────
+        # # Compression ratio: T → T/m
+        # k_compressed, v_compressed = self.kv_compressor(k, v)
+        # # [B, nh, T_c, hd], T_c = T // m
+        # T_c = k_compressed.shape[2]
+        #
+
+        k_compressed, v_compressed = self.kv_compressor.compress(k, v)
         T_c = k_compressed.shape[2]
 
-        # ── Step 3: Lightning Indexer 稀疏选择 ─────────────────────────
-        # 对每个 query，选 top-k 个最相关的压缩 entry
+
+        # # ── Step 3: Lightning Indexer 稀疏选择 ─────────────────────────
+        # # 对每个 query，选 top-k 个最相关的压缩 entry
         topk_indices, topk_scores = self.indexer(q, k_compressed)
         # topk_indices: [B, nh, T, top_k]
         actual_k = topk_indices.shape[-1]
 
         # ── Step 4: Gather selected compressed KV ──────────────────────
         # k_compressed: [B, nh, T_c, hd], topk_indices: [B, nh, T, actual_k]
-        k_flat = k_compressed.reshape(B * nh, T_c, hd)       # [B*nh, T_c, hd]
-        v_flat = v_compressed.reshape(B * nh, T_c, hd)
-        idx_flat = topk_indices.reshape(B * nh, T, actual_k)  # [B*nh, T, actual_k]
+        # k_flat = k_compressed.reshape(B * nh, T_c, hd)       # [B*nh, T_c, hd]
+        # v_flat = v_compressed.reshape(B * nh, T_c, hd)
+        # idx_flat = topk_indices.reshape(B * nh, T, actual_k)  # [B*nh, T, actual_k]
+
+        k_flat = k_compressed.reshape(B*nh, T_c, hd)
+        v_flat = v_compressed.reshape(B*nh, T_c, hd)
+        idx_flat = topk_indices.reshape(B*nh, T, actual_k)
+
 
         # advanced indexing: k_flat[batch_idx, idx_flat] -> [B*nh, T, actual_k, hd]
-        batch_idx = torch.arange(B * nh, device=device).view(B * nh, 1, 1).expand(-1, T, actual_k)
-        k_selected = k_flat[batch_idx, idx_flat]
-        v_selected = v_flat[batch_idx, idx_flat]
+        # TODO
+        # batch_idx = torch.arange(B * nh, device=device).view(B * nh, 1, 1).expand(-1, T, actual_k)
+        # k_selected = k_flat[batch_idx, idx_flat]
+        # v_selected = v_flat[batch_idx, idx_flat]
+        #
+        # k_selected = k_selected.view(B, nh, T, actual_k, hd)
+        # v_selected = v_selected.view(B, nh, T, actual_k, hd)
 
-        k_selected = k_selected.view(B, nh, T, actual_k, hd)
-        v_selected = v_selected.view(B, nh, T, actual_k, hd)
+        # TODO
 
         # ── Step 5: 滑动窗口 KV ────────────────────────────────────────
         # 保留最近 window_size 个 token 的原始 KV（未压缩）
@@ -1556,9 +1602,9 @@ if __name__ == "__main__":
     print("=" * 62)
 
     # Part 1-6: Hybrid Attention
-    test_kv_compressor()
+    # test_kv_compressor()
     # test_lightning_indexer()
-    # test_csa()
+    test_csa()
     # test_hca()
     # test_hybrid_block()
     # test_v4_hybrid_stack()
