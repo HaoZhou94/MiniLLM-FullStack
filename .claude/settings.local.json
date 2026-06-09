@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/hao.zhou/anaconda3/envs/llama3/python *)"
+    ]
+  }
+}
